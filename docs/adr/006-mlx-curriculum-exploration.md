@@ -404,17 +404,18 @@ The v2 curriculum fix completed on the Intel/NVIDIA machine. Key implementation 
 - **King Wen mapping:** Uses `KING_WEN_SURPRISE` values from `king_wen_schedules.py` (63 pre-computed surprise values, padded to 64 with neutral 0.5). Greedy rank assignment maps surprise values to difficulty-sorted batches.
 - **All orderings beat sequential by 0.039-0.106 bpb** — random shuffle best, King Wen worst non-sequential
 
-### Cross-platform comparison plan
+### Cross-platform comparison — resolved
 
-- MLX Phase 2 at DEPTH=4 provides direct cross-platform comparison with CUDA v2 results
-- Key question: does random still win on MLX? The MLX dataloader uses the same `make_dataloader` from `prepare.py`, so the best-fit packing correlation should be identical. But MLX has no torch.compile, so any torch.compile-related interaction is absent.
-- If random wins on both platforms → decorrelation hypothesis confirmed, platform-independent
-- If random wins on CUDA but not MLX → the effect involves torch.compile's interaction with tensor patterns
-- The Intel machine cannot test DEPTH=8 or 12. Scale-dependent findings from the MacBook Pro are unique.
+Both machines now have results with both metrics. The verdict:
 
-### Difficulty metric alignment
+- **Random wins on CUDA but not MLX** → the effect involves torch.compile's interaction with data access patterns
+- Decorrelation hypothesis is **partially supported**: buffering helps on both platforms (~0.038 on MLX, ~0.138 on CUDA), but the magnitude is 3.5x larger on CUDA
+- torch.compile amplifies the decorrelation benefit, likely through kernel-level optimization that overfits to sequential data patterns
+- The Intel machine cannot test DEPTH=8 or 12. The DEPTH=6 King Wen reversal (best at D6+const LR) is unique to the MacBook Pro experiments.
 
-Both machines will use **compression ratio** as the primary difficulty metric. The CUDA v2 token-diversity results are retained as a historical baseline. The 2060 rerun instructions are in `docs/adr/006a-cuda-rerun.md`. Phase 3e on MLX compares compression ratio vs token diversity vs loss-based scoring.
+### Difficulty metric alignment — complete
+
+Both machines have compression ratio results. CUDA also has token diversity. The metric changes relative rankings (King Wen improves most with compression ratio) but does not explain the platform gap. Full comparison in `006a-cuda-rerun.md`.
 
 ---
 
@@ -489,18 +490,37 @@ Per the pre-registered protocol, no ordering beat sequential by more than the no
 - Both standard warmdown and constant LR regimes
 - Single seed (42)
 
-**What was NOT tested** (and may produce different results):
-- Token diversity metric (CUDA's metric, which showed large effects)
+### CUDA Compression-Ratio Rerun Results (ADR-006a, completed 2026-03-23)
+
+The 2060 reran all orderings with compression ratio. Full results in `006a-cuda-rerun.md`.
+
+| Ordering | CUDA token-div | CUDA comp-ratio | MLX comp-ratio (std WD) |
+|----------|---------------|-----------------|------------------------|
+| sequential | 1.719 | 1.778 | 1.732 |
+| buffered_passthrough | 1.680 | 1.640 | 1.735 |
+| random | **1.614** | **1.627** | 1.713 |
+| easy_to_hard | 1.632 | 1.634 | **1.695** |
+| hard_to_easy | 1.627 | 1.634 | 1.709 |
+| king_wen | 1.662 | 1.638 | 1.724 |
+
+**Conclusion: The curriculum effect is platform-dependent, not metric-dependent.**
+
+CUDA with compression ratio still shows massive effects (0.138-0.151 bpb improvement from any reordering). MLX shows 0.008-0.037 bpb — within seed noise. The platform difference (4-10x) vastly exceeds the metric difference.
+
+**Working hypothesis: torch.compile amplifies decorrelation benefits.** torch.compile optimizes kernel execution graphs based on data access patterns. Sequential correlation from best-fit packing feeds into kernel-level optimization in a way that creates local overfitting. Breaking this correlation disrupts compiled kernels, forcing more generalized computation. MLX has no compiled kernel graph, so this amplification is absent.
+
+Secondary observation: compression ratio collapsed the CUDA ordering spread from 0.048 to 0.011 — random still wins but all orderings are nearly tied. King Wen improved most from the metric change (from worst to middle of pack).
+
+**Remaining untested:**
+- Token diversity metric on MLX (for exact CUDA parity)
 - Loss-based difficulty scoring
-- Multi-seed validation of the near-threshold results
-- Curriculum-as-warmup (first 50% ordered, rest random)
-- Larger EVAL_TOKENS for more precise val_bpb measurement
+- Multi-seed validation of near-threshold results
+- Curriculum-as-warmup
 
 **Recommended next steps:**
-1. Run the 2060 compression-ratio rerun (ADR-006a) to determine whether the CUDA effect is metric-dependent
-2. If 2060 rerun with compression ratio also shows null → the CUDA effect was token-diversity-specific
-3. If 2060 rerun with compression ratio still shows large effects → the MLX/CUDA difference is real and worth investigating
-4. Consider running the autonomous loop (Approach B) from the best baseline at DEPTH=4 to explore non-curriculum improvements
+1. Token diversity metric on MLX at DEPTH=4 — if this shows a large effect, the metric IS the key variable (not the platform)
+2. If token diversity on MLX is also null → platform difference is confirmed; curriculum is a CUDA phenomenon at this scale
+3. Run the autonomous loop (Approach B) from DEPTH=4 baseline for non-curriculum improvements
 
 ---
 
