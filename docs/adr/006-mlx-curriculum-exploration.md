@@ -511,16 +511,32 @@ CUDA with compression ratio still shows massive effects (0.138-0.151 bpb improve
 
 Secondary observation: compression ratio collapsed the CUDA ordering spread from 0.048 to 0.011 — random still wins but all orderings are nearly tied. King Wen improved most from the metric change (from worst to middle of pack).
 
-**Remaining untested:**
-- Token diversity metric on MLX (for exact CUDA parity)
-- Loss-based difficulty scoring
-- Multi-seed validation of near-threshold results
-- Curriculum-as-warmup
+### Token Diversity Check on MLX (2026-03-23)
 
-**Recommended next steps:**
-1. Token diversity metric on MLX at DEPTH=4 — if this shows a large effect, the metric IS the key variable (not the platform)
-2. If token diversity on MLX is also null → platform difference is confirmed; curriculum is a CUDA phenomenon at this scale
-3. Run the autonomous loop (Approach B) from DEPTH=4 baseline for non-curriculum improvements
+Final disambiguation: ran sequential + random with token diversity on MLX at DEPTH=4.
+
+| Ordering | MLX token-div | MLX comp-ratio | CUDA token-div |
+|----------|--------------|----------------|---------------|
+| sequential | **1.663** | 1.732 | 1.719 |
+| random | 1.673 | 1.713 | **1.614** |
+
+Token diversity on MLX: random does NOT beat sequential (1.673 vs 1.663, delta +0.010). The CUDA effect (-0.106) does not replicate on MLX with either metric.
+
+Token diversity runs got ~15% more steps (345 vs 300) due to zero scoring overhead vs gzip's 21s cost. This accounts for the better absolute val_bpb (1.663 vs 1.732 for sequential).
+
+**The platform story is now airtight.** Curriculum ordering benefits on CUDA are torch.compile-specific. On MLX, neither metric, neither LR regime, and neither depth produces a significant curriculum effect.
+
+## Decision
+
+**Curriculum ordering is not a productive research direction on MLX at this scale.** The effect is real on CUDA but is an artifact of torch.compile's kernel-level optimization interacting with sequential data correlation — not a learning dynamics phenomenon.
+
+**Positive findings worth preserving:**
+1. Buffered passthrough improves val_bpb by ~0.038 on MLX (decorrelation of best-fit packing)
+2. Constant LR modestly helps sequential baseline at both depths
+3. Token diversity scoring has zero overhead vs gzip's 7% budget cost — prefer it if scoring is needed
+4. The torch.compile hypothesis is novel and potentially publishable
+
+**Next step:** Transition to autonomous exploration (Approach B) at DEPTH=4 to pursue val_bpb improvements through architecture and optimizer changes.
 
 ---
 

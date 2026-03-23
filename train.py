@@ -413,10 +413,17 @@ KING_WEN_SURPRISE = [(s - _min_s) / (_max_s - _min_s) for s in KING_WEN_SURPRISE
 # Curriculum dataloader: buffered batch reordering by difficulty
 # ---------------------------------------------------------------------------
 
+DIFFICULTY_METRIC = os.environ.get("AUTORESEARCH_DIFFICULTY_METRIC", "compression_ratio")
+
+
 def score_batch_difficulty(x):
-    """Compression ratio: gzip compressed / raw bytes. Higher = harder."""
-    raw = np.array(x).tobytes()
-    return len(gzip.compress(raw)) / len(raw)
+    """Score batch difficulty. Metric selected by AUTORESEARCH_DIFFICULTY_METRIC env var."""
+    if DIFFICULTY_METRIC == "token_diversity":
+        arr = np.array(x).ravel()
+        return len(np.unique(arr)) / len(arr)
+    else:  # compression_ratio (default)
+        raw = np.array(x).tobytes()
+        return len(gzip.compress(raw)) / len(raw)
 
 
 def curriculum_dataloader(base_loader, ordering="none", buffer_size=64):
@@ -641,3 +648,4 @@ print(f"curriculum:       {CURRICULUM_ORDERING}")
 print(f"curriculum_overhead_s: {curriculum_overhead_seconds:.1f}")
 print(f"warmdown_ratio:   {WARMDOWN_RATIO}")
 print(f"final_lr_frac:    {FINAL_LR_FRAC}")
+print(f"difficulty_metric: {DIFFICULTY_METRIC}")
