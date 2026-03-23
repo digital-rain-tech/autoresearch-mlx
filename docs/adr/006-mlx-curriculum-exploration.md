@@ -7,23 +7,52 @@
 
 ## Motivation
 
-ADR-002 showed King Wen LR modulation hurts training. ADR-003 reframed King Wen as a curriculum ordering strategy, but implementation v1 on PyTorch/CUDA was blocked by a torch.compile tensor-cloning bug. A v2 fix is in progress on the Intel/NVIDIA RTX 2060 machine.
+ADR-002 showed King Wen LR modulation hurts training. ADR-003 reframed King Wen as a curriculum ordering strategy, but implementation v1 on PyTorch/CUDA was blocked by a torch.compile tensor-cloning bug.
 
-This ADR designs a new, broader experiment on the 96 GB MacBook Pro using the MLX port. MLX does not use torch.compile, so the buffer bug likely does not apply. The 96 GB unified memory also enables model scales (DEPTH=8, 12) impossible on the 6 GB RTX 2060.
+**The v2 fix has now completed on the Intel/NVIDIA RTX 2060 machine.** Results are significant and reshape the research question:
 
-Concurrent literature review (arXiv:2511.18903, arXiv:2506.11300, arXiv:2508.15475) revealed critical findings:
-1. Standard LR decay suppresses curriculum benefits by up to 44x
-2. Compression ratio, lexical diversity, and readability are the strongest difficulty signals
-3. Curriculum-as-warmup yields lasting gains of up to 3.5%
-4. Model-centric difficulty scoring outperforms human heuristics
+### CUDA v2 Curriculum Results (DEPTH=4, standard warmdown, token diversity metric)
 
-This experiment incorporates these findings into a three-phase design that tests **ordering × LR regime × model scale** interactions.
+| Ordering | val_bpb | vs Sequential | Significant? |
+|----------|---------|--------------|-------------|
+| sequential (no buffer) | 1.719 | — | — |
+| buffered_passthrough | 1.680 | -0.039 | Borderline (≈ seed noise) |
+| **random shuffle** | **1.614** | **-0.106** | **Yes** |
+| easy_to_hard | 1.632 | -0.087 | Yes |
+| hard_to_easy | 1.627 | -0.092 | Yes |
+| shao_yong | 1.638 | -0.081 | Yes |
+| king_wen | 1.662 | -0.057 | Yes |
+
+**Key findings:**
+1. **ALL reorderings beat sequential** — by 0.039 to 0.106 bpb, well beyond the 0.04 seed noise floor
+2. **Random shuffle is the BEST ordering** — contradicts curriculum learning theory
+3. **King Wen is the WORST non-sequential ordering** — anti-habituation hypothesis not supported for curriculum either
+4. **hard_to_easy ≈ easy_to_hard** — difficulty direction barely matters (0.005 difference)
+5. **Buffered passthrough itself helps** — suggests the dataloader's best-fit packing creates sequential correlation that any disruption breaks
+
+**Why random wins (working hypothesis):** The `make_dataloader` in `prepare.py` uses best-fit packing, which greedily assigns documents to sequences by size. This creates implicit sequential correlation: adjacent batches share similar document-length distributions and possibly similar content patterns. Any shuffling breaks this correlation. Random shuffling maximizes decorrelation, while structured orderings (easy_to_hard, King Wen) impose new correlations that are less beneficial than pure randomness at this scale.
+
+This is consistent with arXiv:2404.10830 ("Fewer Truncations Improve Language Modeling"), which documents that best-fit packing creates deterministic ordering biases, though that paper does not investigate shuffling as a remedy.
+
+**No published precedent found** for random outperforming curriculum in LLM pretraining. The literature consistently shows curriculum helps (arXiv:2506.11300, arXiv:2511.18903). Our result may be specific to: (a) very small models (DEPTH=4, ~3M params), (b) very short training (5 min), or (c) the interaction between best-fit packing and token-diversity scoring. This makes the MLX experiments on larger models especially important — does the random advantage hold at DEPTH=8/12?
+
+### Literature findings
+
+Concurrent literature review (arXiv:2511.18903, arXiv:2506.11300, arXiv:2508.15475) revealed:
+1. Standard LR decay suppresses curriculum benefits by up to 44x (arXiv:2511.18903)
+2. Compression ratio, lexical diversity, and readability are the strongest difficulty signals (arXiv:2506.11300)
+3. Curriculum-as-warmup yields lasting gains of up to 3.5% (arXiv:2506.11300)
+4. Model-centric difficulty scoring outperforms human heuristics (arXiv:2508.15475)
 
 Note: arXiv:2508.15475 (influence-driven curriculum) informed the decision to include loss-based scoring as a Phase 3 difficulty metric comparison. Influence scoring itself is too expensive for a 5-minute budget (requires a surrogate model), but loss-based scoring is a cheap approximation of the same idea: let the model define difficulty rather than a static heuristic.
 
-## Core Research Question
+## Core Research Questions (revised)
 
-Does data ordering interact with LR regime and model scale to produce meaningful val_bpb improvements under a fixed 5-minute training budget on Apple Silicon?
+Given the CUDA v2 results, the experiment now has **three** questions in priority order:
+
+1. **Decorrelation hypothesis:** Is the benefit of reordering primarily from breaking best-fit packing's sequential correlation? (Test: does random shuffle also win on MLX, where the dataloader is different?)
+2. **Scale interaction:** Does curriculum ordering (easy_to_hard) overtake random at larger model scales (DEPTH=8, 12), as the literature predicts?
+3. **LR regime interaction:** Does constant LR amplify curriculum benefits relative to standard warmdown, potentially reversing the random > curriculum result?
 
 ---
 
@@ -226,7 +255,7 @@ Model averaging (CMA) deferred to Phase 3. Test the simpler version first.
 
 `TOTAL_BATCH_SIZE` is held constant at 2^16 = 65536 tokens across all depths. This means `grad_accum_steps` varies with `DEVICE_BATCH_SIZE` (e.g., 2 at batch 16, 4 at batch 8). This is a deliberate choice: we want to isolate the effect of model capacity (depth) from batch size effects. If a depth comparison appears confounded by batch dynamics, this can be revisited, but the default is to hold total batch size constant.
 
-**Difficulty metric:** Compression ratio only. Literature's strongest performer. If curriculum shows no effect with the best-known metric, testing weaker metrics is not justified. Metric comparison deferred to Phase 3.
+**Difficulty metric:** Compression ratio for Phase 2 on BOTH machines. Literature's strongest performer (arXiv:2506.11300). The CUDA v2 results used token diversity — those serve as a historical comparison point. A compression-ratio rerun on the 2060 is specified in the companion document `docs/adr/006a-cuda-rerun.md`.
 
 ### Run matrix
 
@@ -243,13 +272,14 @@ A condition is a **provisional winner** if:
 
 For King Wen specifically: must beat ALL of random, easy_to_hard, and hard_to_easy at the same depth/LR.
 
-### Analysis priorities (in order)
+### Analysis priorities (in order, revised based on CUDA v2 results)
 
-1. **LR interaction:** Does constant LR amplify curriculum benefits relative to standard warmdown? Compare ordering effect sizes across LR regimes.
-2. **Scale interaction:** Does the curriculum effect grow or shrink with depth?
-3. **King Wen vs easy_to_hard:** If both beat baseline, which one and by how much? If easy_to_hard beats King Wen, anti-habituation may be a liability.
-4. **hard_to_easy diagnostic:** Expected to perform poorly. If it is competitive with easy_to_hard or King Wen, inspect the difficulty metric and learning dynamics before drawing conclusions — this is a diagnostic expectation, not a required outcome.
-5. **Constant LR standalone:** Did constant LR help sequential baseline regardless of curriculum? If yes, that is an independently valuable finding.
+1. **CUDA replication:** Does random shuffle also beat all other orderings on MLX at DEPTH=4? If yes, the decorrelation hypothesis is supported across platforms. If not, the effect is CUDA/torch.compile-specific.
+2. **Scale interaction:** Does easy_to_hard overtake random at larger depths? The literature predicts curriculum helps more at scale. If random still wins at DEPTH=8/12, this challenges the curriculum learning literature for short-budget training.
+3. **LR regime interaction:** Does constant LR change the ordering ranking? The literature (arXiv:2511.18903) predicts curriculum + constant LR should outperform curriculum + warmdown. If constant LR makes easy_to_hard beat random, the CUDA result was confounded by warmdown.
+4. **King Wen position:** CUDA showed King Wen as worst non-sequential ordering. Does this hold on MLX? At larger depths? Under constant LR?
+5. **hard_to_easy vs easy_to_hard:** CUDA showed these are nearly identical (0.005 difference). If this holds, difficulty direction doesn't matter — the benefit is purely from decorrelation, not from any pedagogical ordering.
+6. **Constant LR standalone:** Did constant LR help sequential baseline regardless of ordering? Independently valuable finding.
 
 ---
 
@@ -268,9 +298,11 @@ A winner is **confirmed** only if:
 
 Runs: 3 per winner + 3 matched baselines (may overlap with Phase 1 noise floor runs). ~6-9 runs.
 
-### 3b. King Wen as hypothesis class (if King Wen is a confirmed winner)
+### 3b. King Wen structural analysis (if King Wen beats random at any depth/LR, OR as diagnostic if it remains worst)
 
-Test which structural property drives the effect. All at winning depth/LR, seed 42.
+CUDA v2 showed King Wen as worst non-sequential ordering. If this reverses at larger scale or under constant LR, test which structural property drives the improvement. If King Wen remains worst, run ONE diagnostic variant (reverse King Wen) to test whether the problem is directional flow or the variance profile itself.
+
+All at relevant depth/LR, seed 42.
 
 | Variant | Construction rule | What it isolates |
 |---------|-------------------|-----------------|
@@ -312,10 +344,12 @@ Test whether the difficulty signal matters. All at winning depth/LR/ordering, se
 | Metric | Compute cost | Description |
 |--------|-------------|-------------|
 | Compression ratio | Cheap (~ms per buffer) | gzip ratio, Phase 2 default |
-| Token diversity | Free | unique_tokens / total_tokens, ADR-003's original |
+| Token diversity | Free | unique_tokens / total_tokens, CUDA v2's metric |
 | Loss-based | One forward pass per buffer refill | Model's own mean loss per batch |
 
 3 runs, ~21 min.
+
+Token diversity comparison is now especially valuable: the CUDA v2 results used it, and the 2060 rerun uses compression ratio. If both metrics produce the same ordering ranking, the metric doesn't matter much. If rankings differ, the metric is a first-order variable — which would itself be a finding.
 
 Loss-based is the most accurate but most expensive. Frame this as a diagnostic comparison — loss-based becomes the new default only if it yields a clearly larger gain net of overhead. Otherwise compression ratio is the practical winner.
 
@@ -361,10 +395,26 @@ If Phase 3 produces a null result:
 
 ## Relationship to Intel/NVIDIA RTX 2060 Experiments
 
-- ADR-003 v2 fix is running concurrently on the Intel machine. Results will provide a cross-platform comparison point at DEPTH=4.
-- If both machines produce curriculum results at DEPTH=4, compare: if effects differ, investigate whether the difference is hardware-specific (torch.compile vs MLX) or configuration-specific.
-- The Intel machine cannot test DEPTH=8 or 12. Scale-dependent findings from the MacBook Pro are unique to this experiment.
-- The Intel machine is useful for tiny CUDA confirmation runs on the 1-2 best configurations from this experiment.
+### CUDA v2 results are now available
+
+The v2 curriculum fix completed on the Intel/NVIDIA machine. Key implementation details from the CUDA version:
+
+- **Difficulty metric:** Token diversity (`x.unique().numel() / x.numel()`), NOT compression ratio
+- **Buffer implementation:** CPU pinned memory with single-tensor GPU yield (avoids torch.compile interaction)
+- **King Wen mapping:** Uses `KING_WEN_SURPRISE` values from `king_wen_schedules.py` (63 pre-computed surprise values, padded to 64 with neutral 0.5). Greedy rank assignment maps surprise values to difficulty-sorted batches.
+- **All orderings beat sequential by 0.039-0.106 bpb** — random shuffle best, King Wen worst non-sequential
+
+### Cross-platform comparison plan
+
+- MLX Phase 2 at DEPTH=4 provides direct cross-platform comparison with CUDA v2 results
+- Key question: does random still win on MLX? The MLX dataloader uses the same `make_dataloader` from `prepare.py`, so the best-fit packing correlation should be identical. But MLX has no torch.compile, so any torch.compile-related interaction is absent.
+- If random wins on both platforms → decorrelation hypothesis confirmed, platform-independent
+- If random wins on CUDA but not MLX → the effect involves torch.compile's interaction with tensor patterns
+- The Intel machine cannot test DEPTH=8 or 12. Scale-dependent findings from the MacBook Pro are unique.
+
+### Difficulty metric alignment
+
+Both machines will use **compression ratio** as the primary difficulty metric. The CUDA v2 token-diversity results are retained as a historical baseline. The 2060 rerun instructions are in `docs/adr/006a-cuda-rerun.md`. Phase 3e on MLX compares compression ratio vs token diversity vs loss-based scoring.
 
 ---
 
