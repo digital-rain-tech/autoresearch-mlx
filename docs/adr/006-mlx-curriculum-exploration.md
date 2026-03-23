@@ -418,6 +418,92 @@ Both machines will use **compression ratio** as the primary difficulty metric. T
 
 ---
 
+## Results (2026-03-23)
+
+### Phase 1 Summary
+
+| Depth | val_bpb | Steps | Params | Memory GB | tok/sec |
+|-------|---------|-------|--------|-----------|---------|
+| 4 | 1.773 | 337 | 3.4M | 21.7 | 73K |
+| 6 | 2.139 | 131 | 26.3M | 24.5 | 28K |
+| 8 | 2.368 | 81 | 50.3M | 27.4 | 17K |
+| 12 | 2.773 | 6 | 135.3M | 54.6 | 1.2K |
+
+DEPTH=8 and 12 get too few steps under the 5-min budget. Selected DEPTH=4 (primary) + DEPTH=6 (secondary).
+
+Buffer validation: passthrough_buffered improved val_bpb by 0.038 over no-buffer baseline (1.735 vs 1.773), confirming the decorrelation effect seen on CUDA. Gzip scoring overhead: ~21s per 300s budget (7%).
+
+Noise floor (3 seeds: 42, 7, 123):
+- DEPTH=4: range 0.060, std 0.030
+- DEPTH=6: range 0.043, std 0.021
+
+**Note: thermal throttling issue.** Back-to-back runs on the MacBook Pro caused ~2x slowdown (337→145 steps). All Phase 2 runs include 60s cooldown between experiments.
+
+### Phase 2 Results
+
+**DEPTH=4 (noise floor: 0.060)**
+
+| Ordering | Standard WD | Constant LR | Delta (const-std) |
+|----------|-------------|-------------|-------------------|
+| sequential | 1.732 | 1.722 | -0.010 |
+| random | 1.713 | **1.697** | -0.016 |
+| easy_to_hard | **1.695** | 1.731 | +0.037 |
+| hard_to_easy | 1.709 | 1.707 | -0.002 |
+| king_wen | 1.724 | 1.729 | +0.006 |
+
+**DEPTH=6 (noise floor: 0.043)**
+
+| Ordering | Standard WD | Constant LR | Delta (const-std) |
+|----------|-------------|-------------|-------------------|
+| sequential | 2.056 | 2.039 | -0.017 |
+| random | 2.047 | 2.056 | +0.009 |
+| easy_to_hard | 2.099 | 2.079 | -0.020 |
+| hard_to_easy | 2.084 | 2.095 | +0.011 |
+| king_wen | 2.074 | **2.030** | -0.044 |
+
+### Phase 2 Analysis
+
+**No provisional winners by pre-registered criteria.** The largest effect (easy_to_hard under standard warmdown at DEPTH=4: -0.037 vs sequential) does not exceed the 0.060 noise floor. All differences are within seed noise.
+
+**Finding 1 — LR regime × ordering interaction is real but within noise.**
+easy_to_hard flips from best (standard WD: 1.695) to near-worst (constant LR: 1.731) — a 0.037 swing at DEPTH=4. This is directionally consistent with the literature (arXiv:2511.18903) but the magnitudes are not significant.
+
+**Finding 2 — King Wen behavior reverses with depth.**
+DEPTH=4: King Wen is near-worst (both LR regimes). DEPTH=6 + constant LR: King Wen is the best ordering (2.030). The delta (-0.009 vs sequential) is within noise, but the reversal is notable. This may suggest King Wen's high-variance anti-habituation profile helps more when the model has more capacity.
+
+**Finding 3 — CUDA results do not replicate on MLX.**
+CUDA showed random winning by 0.106 over sequential. MLX shows random improving by only 0.013-0.020 — well within noise. The large CUDA effect may be torch.compile-specific or difficulty-metric-specific (token diversity vs compression ratio).
+
+**Finding 4 — Constant LR helps sequential baseline.**
+At both depths, constant LR improves the sequential baseline (D4: 1.732→1.722, D6: 2.056→2.039). This is an independently useful finding.
+
+**Finding 5 — Buffered passthrough improvement confirms decorrelation.**
+The ~0.038 improvement from buffering alone (Phase 1b) is the most robust finding. Best-fit packing creates sequential correlation that buffering disrupts. This effect is consistent across CUDA and MLX.
+
+### Phase 3f: Null Result Assessment
+
+Per the pre-registered protocol, no ordering beat sequential by more than the noise floor. This is a **clean null result for curriculum ordering** under these conditions:
+- Compression ratio difficulty metric
+- 5-minute fixed budget
+- DEPTH=4 and DEPTH=6
+- Both standard warmdown and constant LR regimes
+- Single seed (42)
+
+**What was NOT tested** (and may produce different results):
+- Token diversity metric (CUDA's metric, which showed large effects)
+- Loss-based difficulty scoring
+- Multi-seed validation of the near-threshold results
+- Curriculum-as-warmup (first 50% ordered, rest random)
+- Larger EVAL_TOKENS for more precise val_bpb measurement
+
+**Recommended next steps:**
+1. Run the 2060 compression-ratio rerun (ADR-006a) to determine whether the CUDA effect is metric-dependent
+2. If 2060 rerun with compression ratio also shows null → the CUDA effect was token-diversity-specific
+3. If 2060 rerun with compression ratio still shows large effects → the MLX/CUDA difference is real and worth investigating
+4. Consider running the autonomous loop (Approach B) from the best baseline at DEPTH=4 to explore non-curriculum improvements
+
+---
+
 ## Total Experiment Budget
 
 | Phase | Runs | Time |

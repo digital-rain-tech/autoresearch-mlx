@@ -5,13 +5,16 @@ Usage: uv run train.py
 """
 
 import gc
+import gzip
 import math
 import os
+import random
 import time
 from dataclasses import dataclass
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.utils import tree_flatten, tree_map
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, evaluate_bpb, make_dataloader
@@ -378,6 +381,113 @@ DEVICE_BATCH_SIZE = 16
 FINAL_EVAL_BATCH_SIZE = 256
 STARTUP_EXCLUDE_STEPS = 1
 
+# ---------------------------------------------------------------------------
+# Environment variable overrides (ADR-006)
+# ---------------------------------------------------------------------------
+DEPTH = int(os.environ.get("AUTORESEARCH_DEPTH", str(DEPTH)))
+DEVICE_BATCH_SIZE = int(os.environ.get("AUTORESEARCH_DEVICE_BATCH_SIZE", str(DEVICE_BATCH_SIZE)))
+WARMDOWN_RATIO = float(os.environ.get("AUTORESEARCH_WARMDOWN_RATIO", str(WARMDOWN_RATIO)))
+FINAL_LR_FRAC = float(os.environ.get("AUTORESEARCH_FINAL_LR_FRAC", str(FINAL_LR_FRAC)))
+_SEED = int(os.environ.get("AUTORESEARCH_SEED", "42"))
+CURRICULUM_ORDERING = os.environ.get("AUTORESEARCH_CURRICULUM", "none")
+CURRICULUM_BUFFER_SIZE = 64
+
+# ---------------------------------------------------------------------------
+# King Wen surprise values (from king_wen_schedules.py)
+# ---------------------------------------------------------------------------
+KING_WEN_SURPRISE_RAW = [
+    2.3026, 1.0498, 0.7133, 0.6539, 0.9676, 1.1874, 0.1625, 0.5798,
+    0.2963, 0.4155, 0.6539, 0.4463, 0.1532, 0.9293, 0.3285, 0.8675,
+    0.4463, 0.7985, 0.1625, 0.5390, 0.2744, 0.7560, 0.1985, 0.4155,
+    0.2231, 0.7985, 0.7985, 0.7133, 0.5390, 0.7560, 0.3567, 0.2744,
+    0.9293, 0.7133, 0.4463, 1.1874, 0.1532, 0.2744, 1.5141, 0.7560,
+    0.5390, 0.2744, 0.2744, 0.7133, 0.2231, 0.1985, 0.4463, 0.9676,
+    0.3567, 0.4463, 0.4463, 0.9676, 0.4463, 0.7133, 0.7133, 0.7560,
+    0.5390, 0.2744, 0.9293, 0.4463, 0.1532, 0.7985, 0.3567,
+]
+_min_s = min(KING_WEN_SURPRISE_RAW)
+_max_s = max(KING_WEN_SURPRISE_RAW)
+KING_WEN_SURPRISE = [(s - _min_s) / (_max_s - _min_s) for s in KING_WEN_SURPRISE_RAW]
+
+# ---------------------------------------------------------------------------
+# Curriculum dataloader: buffered batch reordering by difficulty
+# ---------------------------------------------------------------------------
+
+def score_batch_difficulty(x):
+    """Compression ratio: gzip compressed / raw bytes. Higher = harder."""
+    raw = np.array(x).tobytes()
+    return len(gzip.compress(raw)) / len(raw)
+
+
+def curriculum_dataloader(base_loader, ordering="none", buffer_size=64):
+    """Wrap a dataloader with curriculum-ordered buffering.
+
+    Buffers `buffer_size` micro-batches as MLX arrays, scores by difficulty,
+    reorders according to `ordering`, then yields one at a time.
+    """
+    if ordering == "none":
+        yield from base_loader
+        return
+
+    # Build King Wen target ranks (pad to buffer_size with neutral 0.5)
+    kw_values = list(KING_WEN_SURPRISE) + [0.5] * (buffer_size - len(KING_WEN_SURPRISE))
+    kw_target_ranks = [round(v * (buffer_size - 1)) for v in kw_values[:buffer_size]]
+
+    rng = random.Random(42)
+    global curriculum_overhead_seconds
+    curriculum_overhead_seconds = 0.0
+
+    while True:
+        # Fill buffer
+        buf_x, buf_y = [], []
+        last_epoch = 0
+        for _ in range(buffer_size):
+            x, y, epoch = next(base_loader)
+            buf_x.append(x)
+            buf_y.append(y)
+            last_epoch = epoch
+
+        t_score = time.time()
+
+        if ordering == "passthrough_buffered":
+            # Buffer but no scoring, no reordering — isolates buffer mechanics
+            indices = list(range(buffer_size))
+        elif ordering == "random":
+            indices = list(range(buffer_size))
+            rng.shuffle(indices)
+        else:
+            # Score each batch
+            scores = [score_batch_difficulty(buf_x[i]) for i in range(buffer_size)]
+
+            if ordering == "sequential":
+                # Buffer + score but yield in original order
+                indices = list(range(buffer_size))
+            elif ordering == "easy_to_hard":
+                indices = sorted(range(buffer_size), key=lambda i: scores[i])
+            elif ordering == "hard_to_easy":
+                indices = sorted(range(buffer_size), key=lambda i: scores[i], reverse=True)
+            elif ordering == "king_wen":
+                sorted_by_diff = sorted(range(buffer_size), key=lambda i: scores[i])
+                used = set()
+                indices = []
+                for rank in kw_target_ranks:
+                    best_j = min(
+                        (j for j in range(buffer_size) if j not in used),
+                        key=lambda j: abs(j - rank),
+                    )
+                    indices.append(sorted_by_diff[best_j])
+                    used.add(best_j)
+            else:
+                indices = list(range(buffer_size))
+
+        curriculum_overhead_seconds += time.time() - t_score
+
+        for i in indices:
+            yield buf_x[i], buf_y[i], last_epoch
+
+
+curriculum_overhead_seconds = 0.0
+
 
 def get_lr_multiplier(progress):
     if progress < WARMUP_RATIO:
@@ -389,11 +499,13 @@ def get_lr_multiplier(progress):
 
 
 t_start = time.time()
-mx.random.seed(42)
+mx.random.seed(_SEED)
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
-train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+_raw_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
+train_loader = curriculum_dataloader(_raw_loader, ordering=CURRICULUM_ORDERING,
+                                     buffer_size=CURRICULUM_BUFFER_SIZE)
 x, y, epoch = next(train_loader)
 t_data = time.time()
 print(f"Data/tokenizer loaded in {t_data - t_start:.1f}s")
@@ -524,3 +636,8 @@ print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
 print(f"num_steps:        {step}")
 print(f"num_params_M:     {num_params / 1e6:.1f}")
 print(f"depth:            {DEPTH}")
+print(f"seed:             {_SEED}")
+print(f"curriculum:       {CURRICULUM_ORDERING}")
+print(f"curriculum_overhead_s: {curriculum_overhead_seconds:.1f}")
+print(f"warmdown_ratio:   {WARMDOWN_RATIO}")
+print(f"final_lr_frac:    {FINAL_LR_FRAC}")
