@@ -9,4 +9,5 @@ cda9546	1.662761	21.2	keep	reduce warmdown ratio from 0.5 to 0.3
 55e299e	1.571471	21.2	keep	halve total batch size to 2^15
 c777109	1.537544	21.2	keep	increase matrix LR from 0.04 to 0.06
 b4441df	1.532428	21.2	keep	reduce weight decay from 0.2 to 0.1
-8c0ed04	1.421766	21.2	keep	replace ReLU^2 with SiLU activation
+4e95ce1	1.421766	21.2	keep	replace ReLU^2 with SiLU activation
+5291a40	1.415683	20.7	keep	reduce MLP hidden from 4x to 3x
