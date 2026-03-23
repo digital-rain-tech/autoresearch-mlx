@@ -7,4 +7,5 @@ c67ad2a	2.695369	26.9	discard	lower weight decay to 0.1
 483f791	1.759905	21.2	keep	baseline on MacBook Pro 96GB (mar23 branch)
 cda9546	1.662761	21.2	keep	reduce warmdown ratio from 0.5 to 0.3
 55e299e	1.571471	21.2	keep	halve total batch size to 2^15
-ecf0a8b	1.537544	21.2	keep	increase matrix LR from 0.04 to 0.06
+c777109	1.537544	21.2	keep	increase matrix LR from 0.04 to 0.06
+77de4b6	1.532428	21.2	keep	reduce weight decay from 0.2 to 0.1
