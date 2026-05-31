@@ -23,8 +23,19 @@ Data and tokenizer are cached in `~/.cache/autoresearch/`.
 
 Two files, strict boundary:
 
-- **`train.py`** — the ONLY mutable file. Contains model (GPT with sliding window attention, value embeddings, RoPE), custom AdamW optimizer (per-parameter LR groups), and training loop. All hyperparameters are module-level constants (lines 354-379). Runs as a top-level script (no `main()` — this is intentional for the autoresearch edit-and-run workflow).
+- **`train.py`** — the ONLY mutable file. Contains model (GPT with sliding window attention, value embeddings, RoPE), custom AdamW optimizer (per-parameter LR groups), curriculum dataloader, and training loop. Hyperparameters are module-level constants in the block following the `Hyperparameters` comment (currently ~line 362; line numbers drift as the file is edited, so locate by name, not number). Runs as a top-level script (no `main()` — intentional for the autoresearch edit-and-run workflow).
 - **`prepare.py`** — READ-ONLY. Data download (ClimbMix-400B parquet shards), BPE tokenizer (rustbpe/tiktoken), best-fit-packing dataloader, and `evaluate_bpb()` evaluation. Constants: `MAX_SEQ_LEN=2048`, `TIME_BUDGET=300`, `EVAL_TOKENS=3*524288`, `VOCAB_SIZE=8192`.
+- **`king_wen_schedules.py`** — standalone helper (King Wen surprise-based LR schedules). NOT imported by `train.py`; the surprise values are inlined into `train.py`. Optional reference only.
+
+### Environment-variable overrides (ADR-006 sweep harness)
+
+`train.py` reads several `AUTORESEARCH_*` env vars at module load so a single committed file can be swept across configs without editing it. This is how the `run_*.log` matrix was generated:
+
+- `AUTORESEARCH_DEPTH`, `AUTORESEARCH_DEVICE_BATCH_SIZE`, `AUTORESEARCH_WARMDOWN_RATIO`, `AUTORESEARCH_FINAL_LR_FRAC`, `AUTORESEARCH_SEED`
+- `AUTORESEARCH_CURRICULUM` — batch reordering: `none` (default), `random`, `sequential`, `easy_to_hard`, `hard_to_easy`, `king_wen`, `passthrough_buffered`
+- `AUTORESEARCH_DIFFICULTY_METRIC` — e.g. `compression_ratio` (default), used to score batches for curriculum ordering
+
+Example: `AUTORESEARCH_DEPTH=6 AUTORESEARCH_CURRICULUM=king_wen uv run train.py > run_d6_king_wen.log 2>&1`
 
 ## Key Metric
 
@@ -55,7 +66,13 @@ Branches: `autoresearch/<tag>` (e.g., `autoresearch/mar23`). Never use `git add 
 ## Research Context
 
 `docs/adr/` contains architectural decision records documenting completed experiments:
+- ADR-001: Why `val_bpb` is the metric
 - ADR-002: King Wen LR modulation hurts training (confirmed harmful)
 - ADR-003: Curriculum ordering blocked by torch.compile buffer bug on PyTorch (MLX may not have this issue)
 - ADR-004: Seed sensitivity is ~0.04 bpb at DEPTH=4 (30-seed sweep)
-- ADR-006: Full curriculum exploration design for this MacBook Pro (the active experiment plan)
+- ADR-005: Junzi hypothesis status and next steps
+- ADR-006 / 006a: Full curriculum exploration design for this MacBook Pro (the active plan) + CUDA rerun
+- ADR-007: 3-state prototype postmortem
+- ADR-008: King Wen mathematical analysis
+
+When concluding an experiment that changes the project's direction or confirms/rejects a hypothesis, add or update an ADR rather than only logging to `results.tsv`.
